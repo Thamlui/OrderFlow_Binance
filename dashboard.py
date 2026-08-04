@@ -10,7 +10,7 @@ import streamlit as st
 
 from Colector import init_db, run_collector_loop
 from strategy import compute_strategy_signals, get_timeframe_context, compute_order_blocks
-from trading_common import get_db_connection, get_db_path, normalize_symbol, use_postgres
+from trading_common import get_db_connection, get_db_path, normalize_symbol, use_postgres, is_railway
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "btcusdt"
@@ -124,7 +124,10 @@ with st.sidebar:
             stop_collector()
             st.rerun()
 
-    st.caption("Mỗi symbol có một database riêng (DuckDB) hoặc dùng chung PostgreSQL nếu có DATABASE_URL")
+    if is_railway():
+        st.caption("🚂 Railway mode | Dùng PostgreSQL (DATABASE_URL) | Collector nên chạy service riêng")
+    else:
+        st.caption("Mỗi symbol có DB riêng (DuckDB) hoặc dùng chung PostgreSQL nếu có DATABASE_URL")
 
 
 symbol = st.session_state.symbol
@@ -134,8 +137,13 @@ db_display = "PostgreSQL (DATABASE_URL)" if use_postgres() else db_path
 
 st.caption(f"Đang theo dõi: {symbol.upper()} | Database: {db_display}")
 
+if is_railway() and use_postgres():
+    st.info("🚂 Railway: Nên chạy **Collector** như một service riêng (Start Command: `python Colector.py btcusdt --no-ui`). Nút Start bên dưới chỉ dùng tạm thời trong web process.")
+elif is_railway() and not use_postgres():
+    st.error("⚠️ Railway + DuckDB = dữ liệu sẽ mất khi restart. Hãy thêm PostgreSQL plugin và set biến DATABASE_URL.")
+
 if st.session_state.collector_thread is None or not st.session_state.collector_thread.is_alive():
-    st.info("Chưa có collector chạy. Hãy nhập symbol rồi nhấn Start / Switch.")
+    st.info("Chưa có collector chạy trong process này. Hãy nhập symbol rồi nhấn Start / Switch (hoặc dùng service collector riêng).")
 else:
     st.success(f"Collector đang chạy cho {symbol.upper()}.")
 
