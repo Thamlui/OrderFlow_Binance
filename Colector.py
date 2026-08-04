@@ -172,9 +172,10 @@ def run_collector_loop(symbol=None, stop_event=None, launch_ui=True):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Collect Binance futures aggregate trades into a DuckDB database")
     parser.add_argument("symbol", nargs="?", default=os.getenv("SYMBOL", DEFAULT_SYMBOL), help="Symbol ví dụ: btcusdt, ethusdt, solusdt")
+    parser.add_argument("--no-ui", action="store_true", help="Không khởi động Streamlit dashboard (dùng cho process collector)")
     args = parser.parse_args()
 
     try:
-        run_collector_loop(args.symbol)
+        run_collector_loop(args.symbol, launch_ui=not args.no_ui)
     except KeyboardInterrupt:
         print("\n[INFO] Đang tắt chương trình...")

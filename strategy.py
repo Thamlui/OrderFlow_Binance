@@ -8,9 +8,14 @@ def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     loss = (-delta).clip(lower=0)
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, float("inf"))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
+    # Fix: when avg_loss == 0 (pure uptrend), RSI must be 100, not 0
+    rs = avg_gain / avg_loss
+    rsi = np.where(
+        avg_loss == 0,
+        np.where(avg_gain > 0, 100.0, 50.0),
+        100.0 - (100.0 / (1.0 + rs)),
+    )
+    return pd.Series(rsi, index=series.index).fillna(50)
 
 
 def _evaluate_row(df: pd.DataFrame, idx: int):
@@ -60,9 +65,10 @@ def _evaluate_row(df: pd.DataFrame, idx: int):
     if zone_short:
         score_short += 1.5
 
-    if score_long >= 7 and score_long >= score_short + 1.5:
+    # Threshold 6: strong trend+momentum+cvd+volume already scores 6 even without RSI/zone points
+    if score_long >= 6 and score_long >= score_short + 1.5:
         return "long"
-    if score_short >= 7 and score_short >= score_long + 1.5:
+    if score_short >= 6 and score_short >= score_long + 1.5:
         return "short"
     return "none"
 

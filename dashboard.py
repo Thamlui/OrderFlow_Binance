@@ -124,14 +124,15 @@ with st.sidebar:
             stop_collector()
             st.rerun()
 
-    st.caption("Mỗi symbol có một database riêng: trading_data_<symbol>.duckdb")
+    st.caption("Mỗi symbol có một database riêng (DuckDB) hoặc dùng chung PostgreSQL nếu có DATABASE_URL")
 
 
 symbol = st.session_state.symbol
 init_db(symbol)
 db_path = get_db_path(symbol, BASE_DIR)
+db_display = "PostgreSQL (DATABASE_URL)" if use_postgres() else db_path
 
-st.caption(f"Đang theo dõi: {symbol.upper()} | Database: {db_path}")
+st.caption(f"Đang theo dõi: {symbol.upper()} | Database: {db_display}")
 
 if st.session_state.collector_thread is None or not st.session_state.collector_thread.is_alive():
     st.info("Chưa có collector chạy. Hãy nhập symbol rồi nhấn Start / Switch.")
