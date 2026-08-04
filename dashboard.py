@@ -69,14 +69,19 @@ def open_db_connection(path=None, symbol=None, max_retries=5):
             return duckdb.connect(path)
         except Exception as e:
             msg = str(e).lower()
-            if any(text in msg for text in [
+            if any(t in msg for t in [
                 "different configuration",
                 "being used by another process",
-                "can\'t open a connection",
+                "can't open a connection",
                 "cannot open file",
                 "could not connect to server",
+                "connection pool exhausted",
+                "too many clients",
+                "ssl",
+                "timeout",
+                "server closed the connection",
             ]):
-                time.sleep(0.2 + attempt * 0.1)
+                time.sleep(0.25 + attempt * 0.15)
                 continue
             raise
     raise RuntimeError("Không thể mở database sau nhiều lần thử.")
