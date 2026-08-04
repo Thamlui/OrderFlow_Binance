@@ -129,7 +129,7 @@ with st.sidebar:
 
 symbol = st.session_state.symbol
 init_db(symbol)
-db_path = get_db_url() if use_postgres() else get_db_path(symbol, BASE_DIR)
+db_path = get_db_path(symbol, BASE_DIR)
 
 st.caption(f"Đang theo dõi: {symbol.upper()} | Database: {db_path}")
 
