@@ -87,12 +87,21 @@ def open_db_connection(path=None, symbol=None, max_retries=5):
     raise RuntimeError("Không thể mở database sau nhiều lần thử.")
 
 
+def _pg_read_df(conn, sql, params=None):
+    """Read SQL into DataFrame without pandas/SQLAlchemy warning (raw psycopg2)."""
+    with conn.cursor() as cur:
+        cur.execute(sql, params or ())
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+    return pd.DataFrame(rows, columns=cols)
+
+
 def fetch_recent_trades(conn, limit=8000):
     if use_postgres():
-        return pd.read_sql(
-            "SELECT timestamp, price, quantity, is_buyer_maker FROM trades ORDER BY timestamp DESC LIMIT %s",
+        return _pg_read_df(
             conn,
-            params=(limit,),
+            "SELECT timestamp, price, quantity, is_buyer_maker FROM trades ORDER BY timestamp DESC LIMIT %s",
+            (limit,),
         )
     return conn.execute(
         """
@@ -158,7 +167,9 @@ def render_live_dashboard(symbol_name):
     conn = open_db_connection(db_path, symbol=symbol)
     try:
         if use_postgres():
-            total_trades = int(pd.read_sql("SELECT COUNT(*) AS cnt FROM trades", conn).iloc[0]["cnt"])
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM trades")
+                total_trades = int(cur.fetchone()[0])
         else:
             total_trades = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         st.write(f"**Tổng số trade đã ghi:** {total_trades}")
@@ -174,10 +185,10 @@ def render_live_dashboard(symbol_name):
         latest_ts = int(df["timestamp"].iloc[-1])
         one_day_ms = 24 * 60 * 60 * 1000
         if use_postgres():
-            df_long = pd.read_sql(
-                "SELECT timestamp, price, quantity, is_buyer_maker FROM trades WHERE timestamp >= %s ORDER BY timestamp ASC",
+            df_long = _pg_read_df(
                 conn,
-                params=(latest_ts - one_day_ms,),
+                "SELECT timestamp, price, quantity, is_buyer_maker FROM trades WHERE timestamp >= %s ORDER BY timestamp ASC",
+                (latest_ts - one_day_ms,),
             )
         else:
             df_long = conn.execute(
@@ -274,10 +285,10 @@ def render_live_dashboard(symbol_name):
         st.subheader("📈 Cumulative Volume Delta")
         fig = px.line(df, x="timestamp", y="cvd", template="plotly_dark")
         fig.update_layout(height=420, margin=dict(t=20, b=20))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         with st.expander("Xem 20 trade gần nhất"):
-            st.dataframe(df.tail(20)[["timestamp", "price", "quantity", "side", "signed_qty"]], use_container_width=True)
+            st.dataframe(df.tail(20)[["timestamp", "price", "quantity", "side", "signed_qty"]], width="stretch")
 
         conn.close()
     except Exception as e:

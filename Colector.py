@@ -65,7 +65,7 @@ def init_db(symbol=None, base_dir=None):
                 )
             conn.commit()
         db_path = get_db_url()
-        print(f"[SUCCESS] Postgres database sẵn sàng (pooled) tại: {db_path}")
+        print("[SUCCESS] Postgres database sẵn sàng (pooled)")
         return db_path
 
     db_path = get_db_path(symbol, base_dir or BASE_DIR)
