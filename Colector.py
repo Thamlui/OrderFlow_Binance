@@ -10,11 +10,11 @@ import time
 import duckdb
 import websockets
 
-from trading_common import get_db_connection, get_db_path, get_db_url, normalize_symbol, use_postgres, is_railway
+from trading_common import get_db_connection, get_db_path, get_db_url, normalize_symbol, use_postgres, is_railway, pg_execute_values
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "btcusdt"
-BATCH_SIZE = 80
+BATCH_SIZE = 120
 
 
 def init_db(symbol=None, base_dir=None):
@@ -22,26 +22,50 @@ def init_db(symbol=None, base_dir=None):
     if use_postgres():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
+                # Base table (compatible with previous deployments)
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS trades (
-                        timestamp BIGINT,
-                        symbol VARCHAR,
-                        price DOUBLE PRECISION,
-                        quantity DOUBLE PRECISION,
-                        is_buyer_maker BOOLEAN
+                        timestamp       BIGINT NOT NULL,
+                        symbol          VARCHAR(32) NOT NULL,
+                        price           DOUBLE PRECISION NOT NULL,
+                        quantity        DOUBLE PRECISION NOT NULL,
+                        is_buyer_maker  BOOLEAN NOT NULL
                     )
                     """
                 )
+                # Add agg_id for deduplication (Binance aggregate trade ID)
+                cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS agg_id BIGINT")
+                # Indexes optimized for dashboard queries (ORDER BY timestamp DESC LIMIT, symbol filter)
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp DESC)"
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades (symbol, timestamp DESC)"
                 )
+                # Unique constraint for dedup — only if no conflicting duplicates
+                cur.execute(
+                    """
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'uq_trades_symbol_agg_id'
+                        ) THEN
+                            BEGIN
+                                -- Partial unique: ignore NULL / 0 agg_id from legacy rows
+                                CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_symbol_agg_id
+                                    ON trades (symbol, agg_id)
+                                    WHERE agg_id IS NOT NULL AND agg_id > 0;
+                            EXCEPTION WHEN others THEN
+                                RAISE NOTICE 'Skip unique index: %', SQLERRM;
+                            END;
+                        END IF;
+                    END $$;
+                    """
+                )
             conn.commit()
         db_path = get_db_url()
-        print(f"[SUCCESS] Postgres database sẵn sàng tại: {db_path}")
+        print(f"[SUCCESS] Postgres database sẵn sàng (pooled) tại: {db_path}")
         return db_path
 
     db_path = get_db_path(symbol, base_dir or BASE_DIR)
@@ -65,28 +89,53 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
     if not trade_batch:
         return
 
-    query = (
-        "INSERT INTO trades (timestamp, symbol, price, quantity, is_buyer_maker) VALUES (%s, %s, %s, %s, %s)"
-        if use_postgres()
-        else "INSERT INTO trades (timestamp, symbol, price, quantity, is_buyer_maker) VALUES (?, ?, ?, ?, ?)"
-    )
+    # trade_batch items: (agg_id, timestamp, symbol, price, qty, is_buyer_maker)
+    # DuckDB path still uses 5-tuple without agg_id for backward compat
+    is_pg = use_postgres()
 
     for attempt in range(max_retries):
         try:
-            if use_postgres():
+            if is_pg:
                 with get_db_connection() as conn:
                     with conn.cursor() as cur:
-                        cur.executemany(query, trade_batch)
+                        # Fast bulk insert via execute_values
+                        sql = """
+                            INSERT INTO trades (agg_id, timestamp, symbol, price, quantity, is_buyer_maker)
+                            VALUES %s
+                        """
+                        pg_execute_values(cur, sql, trade_batch, page_size=150)
                     conn.commit()
             else:
+                # DuckDB: drop agg_id if present (5-tuple expected)
+                duck_batch = [
+                    (t[1], t[2], t[3], t[4], t[5]) if len(t) == 6 else t
+                    for t in trade_batch
+                ]
+                query = "INSERT INTO trades (timestamp, symbol, price, quantity, is_buyer_maker) VALUES (?, ?, ?, ?, ?)"
                 with duckdb.connect(db_path) as conn:
-                    conn.executemany(query, trade_batch)
+                    conn.executemany(query, duck_batch)
             return
         except Exception as e:
-            err = str(e)
-            if "being used by another process" in err or "Cannot open file" in err:
-                sleep_time = 0.2 + attempt * 0.15 + random.uniform(0, 0.1)
+            err = str(e).lower()
+            if any(x in err for x in (
+                "being used by another process",
+                "cannot open file",
+                "connection",
+                "server closed",
+                "ssl",
+                "timeout",
+                "too many clients",
+            )):
+                sleep_time = 0.25 + attempt * 0.2 + random.uniform(0, 0.15)
+                print(f"[DB RETRY {attempt+1}/{max_retries}] {e}")
                 time.sleep(sleep_time)
+                # Reset pool on severe connection errors
+                if is_pg and attempt >= 2:
+                    try:
+                        from trading_common import _close_pg_pool
+                        _close_pg_pool()
+                    except Exception:
+                        pass
             else:
                 print(f"[DB ERROR] {e}")
                 return
@@ -106,12 +155,15 @@ class OrderFlowEngine:
             price = float(trade["p"])
             qty = float(trade["q"])
             is_buyer_maker = trade["m"]
+            # Aggregate trade ID from Binance (used for dedup on reconnect)
+            agg_id = int(trade.get("a") or 0)
 
             self.counter += 1
             if self.counter <= 10 or self.counter % 100 == 0:
                 print(f"[DATA] #{self.counter} | {self.symbol} | Giá: {price} | Qty: {qty}")
 
-            self.trade_buffer.append((timestamp, self.symbol, price, qty, is_buyer_maker))
+            # (agg_id, timestamp, symbol, price, qty, is_buyer_maker)
+            self.trade_buffer.append((agg_id, timestamp, self.symbol, price, qty, is_buyer_maker))
 
             if len(self.trade_buffer) >= BATCH_SIZE:
                 save_trades_batch(self.db_path, self.trade_buffer)
