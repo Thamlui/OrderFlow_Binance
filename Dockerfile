@@ -1,22 +1,33 @@
-# Use an official lightweight Python image
+# Lightweight Python image optimized for Railway
 FROM python:3.12-slim
 
-# Set working directory
 WORKDIR /app
 
-# Prevent Python from writing pyc files and buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    STREAMLIT_SERVER_HEADLESS=true \
+    STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+    STREAMLIT_SERVER_FILE_WATCHER_TYPE=none
 
-# Install Python dependencies
-COPY requirements.txt ./
+# Minimal system deps (psycopg2-binary usually enough; curl for optional health)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
 COPY . /app
 
-# Expose the port Cloud Run expects
+# Railway injects $PORT at runtime
 EXPOSE 8080
 
-# Run the Streamlit app on the container-provided port
-CMD ["sh", "-c", "export STREAMLIT_SERVER_PORT=\"${PORT:-8080}\" && streamlit run dashboard.py --server.address=0.0.0.0 --server.port=$STREAMLIT_SERVER_PORT"]
+# Default: run Streamlit dashboard (override Start Command in Railway for collector service)
+CMD ["sh", "-c", "streamlit run dashboard.py \
+  --server.address=0.0.0.0 \
+  --server.port=${PORT:-8080} \
+  --server.headless=true \
+  --server.fileWatcherType=none \
+  --browser.gatherUsageStats=false \
+  --server.enableCORS=false \
+  --server.enableXsrfProtection=false"]

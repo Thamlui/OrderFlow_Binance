@@ -4,6 +4,15 @@ import duckdb
 import psycopg2
 
 
+def is_railway() -> bool:
+    """Detect if running on Railway.com"""
+    return bool(
+        os.getenv("RAILWAY_ENVIRONMENT")
+        or os.getenv("RAILWAY_PROJECT_ID")
+        or os.getenv("RAILWAY_SERVICE_ID")
+    )
+
+
 def normalize_symbol(symbol, default="btcusdt"):
     if not symbol:
         symbol = default
@@ -30,7 +39,11 @@ def get_db_path(symbol, base_dir=None):
 def get_db_connection(symbol=None, base_dir=None):
     if use_postgres():
         db_url = get_db_url()
-        return psycopg2.connect(db_url, connect_timeout=5)
+        # Railway Postgres often requires sslmode=require
+        return psycopg2.connect(db_url, connect_timeout=10)
+    if is_railway():
+        # Ephemeral filesystem on Railway — DuckDB data will be lost on every restart
+        print("[WARNING] Running on Railway without DATABASE_URL. Data will NOT persist. Add a PostgreSQL plugin and set DATABASE_URL.")
     return duckdb.connect(get_db_path(symbol, base_dir))
 
 
