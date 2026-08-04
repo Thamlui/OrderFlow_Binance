@@ -10,7 +10,7 @@ import time
 import duckdb
 import websockets
 
-from trading_common import get_db_connection, get_db_path, get_db_url, normalize_symbol, use_postgres
+from trading_common import get_db_connection, get_db_path, get_db_url, normalize_symbol, use_postgres, is_railway
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SYMBOL = "btcusdt"
@@ -32,6 +32,12 @@ def init_db(symbol=None, base_dir=None):
                         is_buyer_maker BOOLEAN
                     )
                     """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp DESC)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades (symbol, timestamp DESC)"
                 )
             conn.commit()
         db_path = get_db_url()
@@ -133,6 +139,11 @@ def launch_dashboard(symbol):
 def run_collector_loop(symbol=None, stop_event=None, launch_ui=True):
     symbol = normalize_symbol(symbol, default=DEFAULT_SYMBOL)
     db_path = init_db(symbol)
+
+    # On Railway never spawn Streamlit from collector process
+    if is_railway():
+        launch_ui = False
+        print("[INFO] Detected Railway environment → running as pure collector (no UI)")
 
     if launch_ui:
         launch_dashboard(symbol)
