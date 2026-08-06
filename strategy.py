@@ -322,8 +322,12 @@ def compute_strategy_signals(df: pd.DataFrame, timeframe="15m"):
 def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int = 24):
     """Volume Profile Buy/Sell for a rolling window (30m, 1H, 4H, 1D).
 
-    Builds price bins over the last `timeframe` window, aggregates buy/sell volume,
-    finds VPOC and approximate Value Area (70%), and ranks buy/sell dominant zones.
+    - Price bins over the last timeframe window
+    - VPOC = highest total volume bin
+    - Value Area ≈ 70% volume expanding from POC (bin edges)
+    - Buy zones: bins with positive delta, ranked by buy volume
+    - Sell zones: bins with negative delta, ranked by sell volume
+    - Bias from signed imbalance % (soft threshold ~4%)
     """
     empty = {
         "timeframe": timeframe,
@@ -336,11 +340,13 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
         "delta": 0.0,
         "buy_pct": 0.0,
         "sell_pct": 0.0,
+        "imbalance_pct": 0.0,
         "bias": "neutral",
         "buy_zones": [],
         "sell_zones": [],
         "poc_buy_vol": 0.0,
         "poc_sell_vol": 0.0,
+        "poc_delta": 0.0,
         "bars_used": 0,
     }
 
@@ -365,7 +371,6 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
     window = work[work["timestamp"] >= (latest_ts - period_ms)].copy()
     if window.empty:
         window = work.tail(min(500, len(work))).copy()
-
     if window.empty:
         return empty
 
@@ -374,31 +379,51 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
     if not np.isfinite(price_min) or not np.isfinite(price_max):
         return empty
 
+    total_buy = float(window["buy_qty"].sum())
+    total_sell = float(window["sell_qty"].sum())
+    total = total_buy + total_sell
+    if total <= 0:
+        return empty
+
+    buy_pct = total_buy / total * 100.0
+    sell_pct = total_sell / total * 100.0
+    imbalance_pct = (total_buy - total_sell) / total * 100.0
+
+    if imbalance_pct >= 4.0:
+        bias = "buy"
+    elif imbalance_pct <= -4.0:
+        bias = "sell"
+    else:
+        bias = "neutral"
+
     if price_max <= price_min:
         mid = price_min
-        total_buy = float(window["buy_qty"].sum())
-        total_sell = float(window["sell_qty"].sum())
-        total = total_buy + total_sell
-        bias = "buy" if total_buy > total_sell * 1.05 else ("sell" if total_sell > total_buy * 1.05 else "neutral")
         empty.update({
             "vpoc": round(mid, 2),
             "vah": round(mid, 2),
             "val": round(mid, 2),
-            "total_buy": total_buy,
-            "total_sell": total_sell,
-            "total_volume": total,
-            "delta": total_buy - total_sell,
-            "buy_pct": (total_buy / total * 100) if total > 0 else 0.0,
-            "sell_pct": (total_sell / total * 100) if total > 0 else 0.0,
+            "total_buy": round(total_buy, 4),
+            "total_sell": round(total_sell, 4),
+            "total_volume": round(total, 4),
+            "delta": round(total_buy - total_sell, 4),
+            "buy_pct": round(buy_pct, 1),
+            "sell_pct": round(sell_pct, 1),
+            "imbalance_pct": round(imbalance_pct, 1),
             "bias": bias,
-            "bars_used": len(window),
+            "bars_used": int(len(window)),
         })
         return empty
 
-    n_bins = max(8, min(int(n_bins), 48))
+    span = price_max - price_min
+    mid_price = (price_min + price_max) / 2.0
+    target_bin_width = max(mid_price * 0.0004, span / 40.0)
+    adaptive_bins = int(np.clip(np.ceil(span / target_bin_width), 12, 40))
+    n_bins = max(12, min(int(n_bins) if n_bins else adaptive_bins, adaptive_bins))
+
     bins = np.linspace(price_min, price_max, n_bins + 1)
     mids = (bins[:-1] + bins[1:]) / 2.0
     labels = list(range(n_bins))
+    window = window.copy()
     window["bin_id"] = pd.cut(
         window["price"], bins=bins, labels=labels, include_lowest=True, duplicates="drop"
     )
@@ -411,17 +436,16 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
     grouped = grouped.reindex(labels, fill_value=0.0)
     grouped["mid"] = mids
     grouped["delta"] = grouped["buy_vol"] - grouped["sell_vol"]
-
-    total_buy = float(grouped["buy_vol"].sum())
-    total_sell = float(grouped["sell_vol"].sum())
-    total = total_buy + total_sell
+    grouped["buy_share"] = grouped["buy_vol"] / grouped["total_vol"].replace(0, np.nan)
+    grouped["price_low"] = bins[:-1]
+    grouped["price_high"] = bins[1:]
 
     poc_idx = int(grouped["total_vol"].idxmax()) if grouped["total_vol"].sum() > 0 else 0
     vpoc = float(grouped.loc[poc_idx, "mid"])
     poc_buy = float(grouped.loc[poc_idx, "buy_vol"])
     poc_sell = float(grouped.loc[poc_idx, "sell_vol"])
+    poc_delta = poc_buy - poc_sell
 
-    # Value Area ~70% volume expanding from POC
     target = total * 0.70
     lo = hi = poc_idx
     cum = float(grouped.loc[poc_idx, "total_vol"])
@@ -436,39 +460,36 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
             cum += max(left_vol, 0.0)
         else:
             break
-    val = float(grouped.loc[lo, "mid"])
-    vah = float(grouped.loc[hi, "mid"])
+    val = float(grouped.loc[lo, "price_low"])
+    vah = float(grouped.loc[hi, "price_high"])
 
-    buy_sorted = grouped.sort_values("buy_vol", ascending=False).head(3)
-    sell_sorted = grouped.sort_values("sell_vol", ascending=False).head(3)
+    def _zone_row(row):
+        return {
+            "price_low": round(float(row["price_low"]), 2),
+            "price_high": round(float(row["price_high"]), 2),
+            "mid": round(float(row["mid"]), 2),
+            "buy_vol": round(float(row["buy_vol"]), 4),
+            "sell_vol": round(float(row["sell_vol"]), 4),
+            "total_vol": round(float(row["total_vol"]), 4),
+            "delta": round(float(row["delta"]), 4),
+        }
 
-    def _zones(frame, side: str):
-        out = []
-        for idx, row in frame.iterrows():
-            vol = float(row["buy_vol"] if side == "buy" else row["sell_vol"])
-            if vol <= 0:
-                continue
-            i = int(idx)
-            out.append({
-                "price_low": round(float(bins[i]), 2),
-                "price_high": round(float(bins[i + 1]), 2),
-                "mid": round(float(row["mid"]), 2),
-                "buy_vol": round(float(row["buy_vol"]), 4),
-                "sell_vol": round(float(row["sell_vol"]), 4),
-                "total_vol": round(float(row["total_vol"]), 4),
-                "delta": round(float(row["delta"]), 4),
-            })
-        return out
+    buy_dom = grouped[grouped["delta"] > 0].sort_values(
+        ["buy_vol", "delta"], ascending=[False, False]
+    )
+    sell_dom = grouped[grouped["delta"] < 0].sort_values(
+        ["sell_vol", "delta"], ascending=[False, True]
+    )
 
-    buy_zones = _zones(buy_sorted, "buy")
-    sell_zones = _zones(sell_sorted, "sell")
+    buy_zones = [_zone_row(r) for _, r in buy_dom.head(3).iterrows()]
+    sell_zones = [_zone_row(r) for _, r in sell_dom.head(3).iterrows()]
 
-    if total_buy > total_sell * 1.08:
-        bias = "buy"
-    elif total_sell > total_buy * 1.08:
-        bias = "sell"
-    else:
-        bias = "neutral"
+    if not buy_zones:
+        fb = grouped.sort_values("buy_vol", ascending=False).head(1)
+        buy_zones = [_zone_row(r) for _, r in fb.iterrows() if float(r["buy_vol"]) > 0]
+    if not sell_zones:
+        fb = grouped.sort_values("sell_vol", ascending=False).head(1)
+        sell_zones = [_zone_row(r) for _, r in fb.iterrows() if float(r["sell_vol"]) > 0]
 
     return {
         "timeframe": timeframe,
@@ -479,12 +500,14 @@ def compute_volume_profile(df: pd.DataFrame, timeframe: str = "30m", n_bins: int
         "total_sell": round(total_sell, 4),
         "total_volume": round(total, 4),
         "delta": round(total_buy - total_sell, 4),
-        "buy_pct": round(total_buy / total * 100, 1) if total > 0 else 0.0,
-        "sell_pct": round(total_sell / total * 100, 1) if total > 0 else 0.0,
+        "buy_pct": round(buy_pct, 1),
+        "sell_pct": round(sell_pct, 1),
+        "imbalance_pct": round(imbalance_pct, 1),
         "bias": bias,
         "buy_zones": buy_zones,
         "sell_zones": sell_zones,
         "poc_buy_vol": round(poc_buy, 4),
         "poc_sell_vol": round(poc_sell, 4),
+        "poc_delta": round(poc_delta, 4),
         "bars_used": int(len(window)),
     }
