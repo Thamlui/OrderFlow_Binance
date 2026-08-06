@@ -1,4 +1,5 @@
 import os
+import threading
 import re
 import atexit
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -69,36 +70,41 @@ def get_db_path(symbol, base_dir=None):
     return os.path.join(base_dir, f"trading_data_{normalized}.duckdb")
 
 
-# --- Connection pool (critical on Railway: low max_connections) ---
+# --- Connection pool (critical on Railway: limited max_connections) ---
+
 _pg_pool = None
+_pool_lock = threading.Lock()
+# Web (Streamlit) needs more concurrent conns than collector; default 8 is safe on Railway
 _POOL_MIN = 1
-_POOL_MAX = int(os.getenv("PG_POOL_MAX", "4"))  # keep small; Railway default max_connections ~100
+_POOL_MAX = int(os.getenv("PG_POOL_MAX", "8"))
 
 
 def _init_pg_pool():
     global _pg_pool
-    if _pg_pool is not None:
+    with _pool_lock:
+        if _pg_pool is not None:
+            return _pg_pool
+        db_url = _normalize_database_url(get_db_url())
+        if not db_url:
+            raise RuntimeError("DATABASE_URL is not set")
+        _pg_pool = pool.ThreadedConnectionPool(
+            minconn=_POOL_MIN,
+            maxconn=_POOL_MAX,
+            dsn=db_url,
+        )
+        print(f"[DB] Postgres pool ready (min={_POOL_MIN}, max={_POOL_MAX})")
         return _pg_pool
-    db_url = _normalize_database_url(get_db_url())
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is not set")
-    _pg_pool = pool.ThreadedConnectionPool(
-        minconn=_POOL_MIN,
-        maxconn=_POOL_MAX,
-        dsn=db_url,
-    )
-    print(f"[DB] Postgres pool ready (min={_POOL_MIN}, max={_POOL_MAX})")
-    return _pg_pool
 
 
 def _close_pg_pool():
     global _pg_pool
-    if _pg_pool is not None:
-        try:
-            _pg_pool.closeall()
-        except Exception:
-            pass
-        _pg_pool = None
+    with _pool_lock:
+        if _pg_pool is not None:
+            try:
+                _pg_pool.closeall()
+            except Exception:
+                pass
+            _pg_pool = None
 
 
 atexit.register(_close_pg_pool)
@@ -117,16 +123,26 @@ class _PooledConnection:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn is None:
             return
+        conn, self.conn = self.conn, None
         try:
             if exc_type is not None:
-                self.conn.rollback()
-            self._pool.putconn(self.conn)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            # putconn(close=True) discards broken connections instead of recycling them
+            try:
+                self._pool.putconn(conn, close=(exc_type is not None))
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         except Exception:
             try:
-                self.conn.close()
+                conn.close()
             except Exception:
                 pass
-        self.conn = None
 
     # Allow use without context manager (dashboard pattern)
     def close(self):
@@ -152,11 +168,25 @@ def get_db_connection(symbol=None, base_dir=None):
     - DuckDB: normal file connection.
     """
     if use_postgres():
-        p = _init_pg_pool()
-        raw = p.getconn()
-        # Make sure autocommit is off (we commit explicitly)
-        raw.autocommit = False
-        return _PooledConnection(raw, p)
+        last_err = None
+        for attempt in range(3):
+            try:
+                p = _init_pg_pool()
+                raw = p.getconn()
+                raw.autocommit = False
+                return _PooledConnection(raw, p)
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                # Pool exhausted / closed → reset and retry
+                if "pool" in msg or "exhausted" in msg or "closed" in msg:
+                    print(f"[DB] pool issue ({e}) → reset pool (attempt {attempt + 1})")
+                    _close_pg_pool()
+                    import time as _time
+                    _time.sleep(0.15 * (attempt + 1))
+                    continue
+                raise
+        raise last_err
 
     if is_railway():
         print(
