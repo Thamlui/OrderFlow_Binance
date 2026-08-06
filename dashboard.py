@@ -244,7 +244,6 @@ def render_live_dashboard(symbol_name):
             st.info("⚖️ Hai bên cân bằng trong 15 phút gần nhất")
 
         st.subheader("📊 Volume Profile Buy / Sell")
-        # Prefer longer history (df_long ~24h) so 4H and 1D profiles have enough ticks
         vp_source = df_long if not df_long.empty else df
         vp_timeframes = ["30m", "1H", "4H", "1D"]
         vp_results = {tf: compute_volume_profile(vp_source, timeframe=tf) for tf in vp_timeframes}
@@ -262,25 +261,24 @@ def render_live_dashboard(symbol_name):
                     st.info(f"{tf} → NEUTRAL")
 
                 if vp.get("vpoc") is not None:
-                    st.caption(f"VPOC: {vp['vpoc']:.2f}")
+                    st.caption(f"VPOC: {vp['vpoc']:.2f}  (Δ {vp.get('poc_delta', 0):+.2f})")
                     st.caption(f"VA: {vp['val']:.2f} – {vp['vah']:.2f}")
                 st.caption(f"Buy: {vp['total_buy']:,.3f} ({vp['buy_pct']:.1f}%)")
                 st.caption(f"Sell: {vp['total_sell']:,.3f} ({vp['sell_pct']:.1f}%)")
-                st.caption(f"Delta: {vp['delta']:+.3f}")
+                st.caption(f"Delta: {vp['delta']:+.3f}  |  Imb: {vp.get('imbalance_pct', 0):+.1f}%")
 
                 if vp.get("buy_zones"):
                     z = vp["buy_zones"][0]
                     st.caption(
-                        f"🟢 Buy zone: {z['price_low']:.2f}–{z['price_high']:.2f} | V: {z['buy_vol']:.3f}"
+                        f"🟢 Buy zone: {z['price_low']:.2f}–{z['price_high']:.2f} | Δ {z['delta']:+.2f}"
                     )
                 if vp.get("sell_zones"):
                     z = vp["sell_zones"][0]
                     st.caption(
-                        f"🔴 Sell zone: {z['price_low']:.2f}–{z['price_high']:.2f} | V: {z['sell_vol']:.3f}"
+                        f"🔴 Sell zone: {z['price_low']:.2f}–{z['price_high']:.2f} | Δ {z['delta']:+.2f}"
                     )
                 st.caption(f"Ticks: {vp.get('bars_used', 0)}")
 
-        # Summary strip across timeframes
         buy_tfs = [tf for tf, v in vp_results.items() if v.get("bias") == "buy"]
         sell_tfs = [tf for tf, v in vp_results.items() if v.get("bias") == "sell"]
         if len(buy_tfs) >= 3:
