@@ -9,7 +9,7 @@ import plotly.express as px
 import streamlit as st
 
 from Colector import init_db, run_collector_loop
-from strategy import compute_strategy_signals, get_timeframe_context, compute_order_blocks
+from strategy import compute_volume_profile
 from trading_common import get_db_connection, get_db_path, normalize_symbol, use_postgres, is_railway
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -243,44 +243,56 @@ def render_live_dashboard(symbol_name):
         else:
             st.info("⚖️ Hai bên cân bằng trong 15 phút gần nhất")
 
-        st.subheader("🎯 Trading Cockpit")
-        tf_signals = {}
-        tf_contexts = {}
-        tf_orderblocks = {}
-        for timeframe in ["15m", "30m", "1H", "4H"]:
-            tf_signals[timeframe] = compute_strategy_signals(df, timeframe=timeframe)
-            tf_contexts[timeframe] = get_timeframe_context(df, timeframe=timeframe)
-            tf_orderblocks[timeframe] = compute_order_blocks(df, timeframe=timeframe)
+        st.subheader("📊 Volume Profile Buy / Sell")
+        # Prefer longer history (df_long ~24h) so 4H and 1D profiles have enough ticks
+        vp_source = df_long if not df_long.empty else df
+        vp_timeframes = ["30m", "1H", "4H", "1D"]
+        vp_results = {tf: compute_volume_profile(vp_source, timeframe=tf) for tf in vp_timeframes}
 
-        st.markdown("### Tín hiệu theo khung thời gian")
-        signal_cols = st.columns(4)
-        for idx, timeframe in enumerate(["15m", "30m", "1H", "4H"]):
-            signal = tf_signals[timeframe]
-            context = tf_contexts[timeframe]
-            orderblock = tf_orderblocks[timeframe]
-            with signal_cols[idx]:
-                if signal["signal"] == "long":
-                    st.success(f"{timeframe} → BUY")
-                elif signal["signal"] == "short":
-                    st.error(f"{timeframe} → SELL")
+        vp_cols = st.columns(4)
+        for idx, tf in enumerate(vp_timeframes):
+            vp = vp_results[tf]
+            with vp_cols[idx]:
+                bias = vp.get("bias", "neutral")
+                if bias == "buy":
+                    st.success(f"{tf} → BUY dominant")
+                elif bias == "sell":
+                    st.error(f"{tf} → SELL dominant")
                 else:
-                    st.info(f"{timeframe} → WAIT")
-                st.caption(f"Bias: {context['trend_bias']} | Strength: {context['trend_strength']}% | RSI: {context['rsi']}")
-                st.caption(f"Support: {context['support_zone']:.2f} | Resistance: {context['resistance_zone']:.2f}")
-                if orderblock['sma'] is not None and orderblock['vpoc'] is not None:
-                    st.caption(f"SMA: {orderblock['sma']:.2f} | VPOC: {orderblock['vpoc']:.2f}")
-                if orderblock['buy_zone'] is not None:
-                    st.caption(f"Buy OB ({orderblock['zone_candles']}c): {orderblock['buy_zone'][0]:.2f} - {orderblock['buy_zone'][1]:.2f} | V: {orderblock['buy_volume']:.1f} | S: {orderblock['buy_strength']}%")
-                if orderblock['sell_zone'] is not None:
-                    st.caption(f"Sell OB ({orderblock['zone_candles']}c): {orderblock['sell_zone'][0]:.2f} - {orderblock['sell_zone'][1]:.2f} | V: {orderblock['sell_volume']:.1f} | S: {orderblock['sell_strength']}%")
+                    st.info(f"{tf} → NEUTRAL")
 
-        primary_signal = tf_signals["15m"]
-        if primary_signal["signal"] == "long":
-            st.success(f"Entry đề xuất: BUY | Entry: {primary_signal['entry_price']:.2f} | SL: {primary_signal['stop_loss']:.2f} | TP: {primary_signal['take_profit']:.2f} | Strength: {primary_signal.get('trend_strength', 0)}%")
-        elif primary_signal["signal"] == "short":
-            st.error(f"Entry đề xuất: SELL | Entry: {primary_signal['entry_price']:.2f} | SL: {primary_signal['stop_loss']:.2f} | TP: {primary_signal['take_profit']:.2f} | Strength: {primary_signal.get('trend_strength', 0)}%")
+                if vp.get("vpoc") is not None:
+                    st.caption(f"VPOC: {vp['vpoc']:.2f}")
+                    st.caption(f"VA: {vp['val']:.2f} – {vp['vah']:.2f}")
+                st.caption(f"Buy: {vp['total_buy']:,.3f} ({vp['buy_pct']:.1f}%)")
+                st.caption(f"Sell: {vp['total_sell']:,.3f} ({vp['sell_pct']:.1f}%)")
+                st.caption(f"Delta: {vp['delta']:+.3f}")
+
+                if vp.get("buy_zones"):
+                    z = vp["buy_zones"][0]
+                    st.caption(
+                        f"🟢 Buy zone: {z['price_low']:.2f}–{z['price_high']:.2f} | V: {z['buy_vol']:.3f}"
+                    )
+                if vp.get("sell_zones"):
+                    z = vp["sell_zones"][0]
+                    st.caption(
+                        f"🔴 Sell zone: {z['price_low']:.2f}–{z['price_high']:.2f} | V: {z['sell_vol']:.3f}"
+                    )
+                st.caption(f"Ticks: {vp.get('bars_used', 0)}")
+
+        # Summary strip across timeframes
+        buy_tfs = [tf for tf, v in vp_results.items() if v.get("bias") == "buy"]
+        sell_tfs = [tf for tf, v in vp_results.items() if v.get("bias") == "sell"]
+        if len(buy_tfs) >= 3:
+            st.success(f"🟢 Volume Profile nghiêng Buy trên: {', '.join(buy_tfs)}")
+        elif len(sell_tfs) >= 3:
+            st.error(f"🔴 Volume Profile nghiêng Sell trên: {', '.join(sell_tfs)}")
+        elif buy_tfs and not sell_tfs:
+            st.success(f"🟢 Buy bias: {', '.join(buy_tfs)}")
+        elif sell_tfs and not buy_tfs:
+            st.error(f"🔴 Sell bias: {', '.join(sell_tfs)}")
         else:
-            st.info(f"Entry đề xuất: Chờ tín hiệu | {primary_signal['reason']}")
+            st.info("⚖️ Volume Profile lẫn lộn giữa các khung — chưa có bias rõ")
 
         st.subheader("📈 Cumulative Volume Delta")
         fig = px.line(df, x="timestamp", y="cvd", template="plotly_dark")
