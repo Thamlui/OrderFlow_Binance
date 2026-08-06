@@ -27,7 +27,6 @@ def init_db(symbol=None, base_dir=None):
     if use_postgres():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Base table (compatible with previous deployments)
                 cur.execute(
                     """
                     CREATE TABLE IF NOT EXISTS trades (
@@ -39,16 +38,13 @@ def init_db(symbol=None, base_dir=None):
                     )
                     """
                 )
-                # Add agg_id for deduplication (Binance aggregate trade ID)
                 cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS agg_id BIGINT")
-                # Indexes optimized for dashboard queries (ORDER BY timestamp DESC LIMIT, symbol filter)
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp DESC)"
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_trades_symbol_ts ON trades (symbol, timestamp DESC)"
                 )
-                # Unique constraint for dedup — only if no conflicting duplicates
                 cur.execute(
                     """
                     DO $$
@@ -57,7 +53,6 @@ def init_db(symbol=None, base_dir=None):
                             SELECT 1 FROM pg_constraint WHERE conname = 'uq_trades_symbol_agg_id'
                         ) THEN
                             BEGIN
-                                -- Partial unique: ignore NULL / 0 agg_id from legacy rows
                                 CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_symbol_agg_id
                                     ON trades (symbol, agg_id)
                                     WHERE agg_id IS NOT NULL AND agg_id > 0;
@@ -90,7 +85,6 @@ def init_db(symbol=None, base_dir=None):
     return db_path
 
 
-# Successful insert counter (process-level) for visibility in Railway logs
 _insert_ok = 0
 _insert_fail = 0
 
@@ -103,7 +97,6 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
     if not trade_batch:
         return
 
-    # trade_batch items: (agg_id, timestamp, symbol, price, qty, is_buyer_maker)
     is_pg = use_postgres()
 
     for attempt in range(max_retries):
@@ -111,8 +104,6 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
             if is_pg:
                 with get_db_connection() as conn:
                     with conn.cursor() as cur:
-                        # ON CONFLICT DO NOTHING → unique(symbol, agg_id) duplicates are skipped
-                        # instead of failing the entire batch (critical after WS reconnect)
                         sql = """
                             INSERT INTO trades (agg_id, timestamp, symbol, price, quantity, is_buyer_maker)
                             VALUES %s
@@ -135,13 +126,11 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
             return
         except Exception as e:
             err = str(e).lower()
-            # Unique / conflict without ON CONFLICT support → not fatal if we can fall back
             if "conflict" in err or "duplicate" in err or "unique" in err:
                 try:
                     if is_pg:
                         with get_db_connection() as conn:
                             with conn.cursor() as cur:
-                                # Row-by-row fallback so one duplicate never drops 119 good rows
                                 for row in trade_batch:
                                     try:
                                         cur.execute(
@@ -150,7 +139,7 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
                                                 (agg_id, timestamp, symbol, price, quantity, is_buyer_maker)
                                             VALUES (%s, %s, %s, %s, %s, %s)
                                             ON CONFLICT DO NOTHING
-                                            "",
+                                            """,
                                             row,
                                         )
                                     except Exception:
@@ -203,14 +192,12 @@ class OrderFlowEngine:
             price = float(trade["p"])
             qty = float(trade["q"])
             is_buyer_maker = trade["m"]
-            # Aggregate trade ID from Binance (used for dedup on reconnect)
             agg_id = int(trade.get("a") or 0)
 
             self.counter += 1
             if self.counter <= 10 or self.counter % 100 == 0:
                 print(f"[DATA] #{self.counter} | {self.symbol} | Giá: {price} | Qty: {qty}")
 
-            # (agg_id, timestamp, symbol, price, qty, is_buyer_maker)
             self.trade_buffer.append((agg_id, timestamp, self.symbol, price, qty, is_buyer_maker))
 
             if len(self.trade_buffer) >= BATCH_SIZE:
@@ -240,7 +227,6 @@ def run_collector_loop(symbol=None, stop_event=None, launch_ui=True):
     symbol = normalize_symbol(symbol, default=DEFAULT_SYMBOL)
     db_path = init_db(symbol)
 
-    # On Railway never spawn Streamlit from collector process
     if is_railway():
         launch_ui = False
         print("[INFO] Detected Railway environment → running as pure collector (no UI)")
@@ -281,7 +267,7 @@ def run_collector_loop(symbol=None, stop_event=None, launch_ui=True):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Collect Binance futures aggregate trades into a DuckDB database")
+    parser = argparse.ArgumentParser(description="Collect Binance futures aggregate trades")
     parser.add_argument("symbol", nargs="?", default=os.getenv("SYMBOL", DEFAULT_SYMBOL), help="Symbol ví dụ: btcusdt, ethusdt, solusdt")
     parser.add_argument("--no-ui", action="store_true", help="Không khởi động Streamlit dashboard (dùng cho process collector)")
     args = parser.parse_args()
