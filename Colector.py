@@ -19,6 +19,11 @@ BATCH_SIZE = 120
 
 def init_db(symbol=None, base_dir=None):
     symbol = normalize_symbol(symbol, default=DEFAULT_SYMBOL)
+    if is_railway() and not use_postgres():
+        print(
+            "[FATAL] Railway detected but DATABASE_URL is missing. "
+            "Trades will NOT persist. Link Postgres and set DATABASE_URL on this service."
+        )
     if use_postgres():
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -85,12 +90,20 @@ def init_db(symbol=None, base_dir=None):
     return db_path
 
 
+# Successful insert counter (process-level) for visibility in Railway logs
+_insert_ok = 0
+_insert_fail = 0
+
+
 def save_trades_batch(db_path, trade_batch, max_retries=7):
+    """Persist a batch of trades. Postgres uses ON CONFLICT DO NOTHING so reconnect
+    duplicates never kill the whole batch.
+    """
+    global _insert_ok, _insert_fail
     if not trade_batch:
         return
 
     # trade_batch items: (agg_id, timestamp, symbol, price, qty, is_buyer_maker)
-    # DuckDB path still uses 5-tuple without agg_id for backward compat
     is_pg = use_postgres()
 
     for attempt in range(max_retries):
@@ -98,15 +111,19 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
             if is_pg:
                 with get_db_connection() as conn:
                     with conn.cursor() as cur:
-                        # Fast bulk insert via execute_values
+                        # ON CONFLICT DO NOTHING → unique(symbol, agg_id) duplicates are skipped
+                        # instead of failing the entire batch (critical after WS reconnect)
                         sql = """
                             INSERT INTO trades (agg_id, timestamp, symbol, price, quantity, is_buyer_maker)
                             VALUES %s
+                            ON CONFLICT DO NOTHING
                         """
-                        pg_execute_values(cur, sql, trade_batch, page_size=150)
+                        pg_execute_values(cur, sql, trade_batch, page_size=200)
                     conn.commit()
+                _insert_ok += len(trade_batch)
+                if _insert_ok <= 500 or _insert_ok % 1000 < len(trade_batch):
+                    print(f"[DB OK] +{len(trade_batch)} trades (total ~{_insert_ok} this process)")
             else:
-                # DuckDB: drop agg_id if present (5-tuple expected)
                 duck_batch = [
                     (t[1], t[2], t[3], t[4], t[5]) if len(t) == 6 else t
                     for t in trade_batch
@@ -114,9 +131,37 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
                 query = "INSERT INTO trades (timestamp, symbol, price, quantity, is_buyer_maker) VALUES (?, ?, ?, ?, ?)"
                 with duckdb.connect(db_path) as conn:
                     conn.executemany(query, duck_batch)
+                _insert_ok += len(trade_batch)
             return
         except Exception as e:
             err = str(e).lower()
+            # Unique / conflict without ON CONFLICT support → not fatal if we can fall back
+            if "conflict" in err or "duplicate" in err or "unique" in err:
+                try:
+                    if is_pg:
+                        with get_db_connection() as conn:
+                            with conn.cursor() as cur:
+                                # Row-by-row fallback so one duplicate never drops 119 good rows
+                                for row in trade_batch:
+                                    try:
+                                        cur.execute(
+                                            """
+                                            INSERT INTO trades
+                                                (agg_id, timestamp, symbol, price, quantity, is_buyer_maker)
+                                            VALUES (%s, %s, %s, %s, %s, %s)
+                                            ON CONFLICT DO NOTHING
+                                            "",
+                                            row,
+                                        )
+                                    except Exception:
+                                        pass
+                            conn.commit()
+                        _insert_ok += len(trade_batch)
+                        print(f"[DB OK] batch saved with per-row fallback ({len(trade_batch)})")
+                        return
+                except Exception as e2:
+                    print(f"[DB ERROR] fallback failed: {e2}")
+
             if any(x in err for x in (
                 "being used by another process",
                 "cannot open file",
@@ -125,21 +170,24 @@ def save_trades_batch(db_path, trade_batch, max_retries=7):
                 "ssl",
                 "timeout",
                 "too many clients",
+                "pool",
+                "exhausted",
             )):
                 sleep_time = 0.25 + attempt * 0.2 + random.uniform(0, 0.15)
                 print(f"[DB RETRY {attempt+1}/{max_retries}] {e}")
                 time.sleep(sleep_time)
-                # Reset pool on severe connection errors
-                if is_pg and attempt >= 2:
+                if is_pg and attempt >= 1:
                     try:
                         from trading_common import _close_pg_pool
                         _close_pg_pool()
                     except Exception:
                         pass
             else:
-                print(f"[DB ERROR] {e}")
+                _insert_fail += 1
+                print(f"[DB ERROR] {_insert_fail} fails | {e}")
                 return
-    print(f"[DB WARNING] Bỏ qua 1 batch sau {max_retries} lần thử")
+    _insert_fail += 1
+    print(f"[DB WARNING] Bỏ qua 1 batch sau {max_retries} lần thử (fail=#{_insert_fail})")
 
 
 class OrderFlowEngine:
