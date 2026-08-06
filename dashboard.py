@@ -80,6 +80,7 @@ def open_db_connection(path=None, symbol=None, max_retries=5):
                 "ssl",
                 "timeout",
                 "server closed the connection",
+                "pool",
             ]):
                 time.sleep(0.25 + attempt * 0.15)
                 continue
@@ -145,7 +146,14 @@ with st.sidebar:
 
 
 symbol = st.session_state.symbol
-init_db(symbol)
+
+@st.cache_resource(show_spinner=False)
+def _ensure_db_schema(_symbol: str):
+    """Run schema init once per process/symbol — avoids pool churn on every Streamlit rerun."""
+    init_db(_symbol)
+    return True
+
+_ensure_db_schema(symbol)
 db_path = get_db_path(symbol, BASE_DIR)
 db_display = "PostgreSQL (DATABASE_URL)" if use_postgres() else db_path
 
@@ -164,8 +172,9 @@ else:
 
 @st.fragment(run_every=2)
 def render_live_dashboard(symbol_name):
-    conn = open_db_connection(db_path, symbol=symbol)
+    conn = None
     try:
+        conn = open_db_connection(db_path, symbol=symbol)
         if use_postgres():
             with conn.cursor() as cur:
                 cur.execute("SELECT COUNT(*) FROM trades")
@@ -300,9 +309,14 @@ def render_live_dashboard(symbol_name):
         with st.expander("Xem 20 trade gần nhất"):
             st.dataframe(df.tail(20)[["timestamp", "price", "quantity", "side", "signed_qty"]], width="stretch")
 
-        conn.close()
     except Exception as e:
         st.error(f"Lỗi đọc Database: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 render_live_dashboard(symbol)
